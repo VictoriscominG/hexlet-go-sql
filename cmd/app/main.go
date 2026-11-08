@@ -85,7 +85,7 @@ func parseID(s string) (int64, error) {
 	return v, nil
 }
 
-// strPtr и intPtr нужны только для генерации тестовых данных в bulk-команде
+// strPtr и intPtr нужны для генерации тестовых данных в bulk-команде
 func strPtr(s string) *string {
 	return &s
 }
@@ -95,13 +95,16 @@ func intPtr(i int) *int {
 }
 
 func main() {
-	action := flag.String("action", "", "action: create|get|list|update|delete|bulk")
+	action := flag.String("action", "", "action: create|get|list|update|delete|bulk|import")
 
 	email := flag.String("email", "", "email (for create)")
 	name := flag.String("name", "", "name (for create/update)")
 	age := flag.String("age", "", "age (for create/update)")
 
 	idStr := flag.String("id", "", "user ID (for get/update/delete)")
+
+	// Флаг для новой команды import
+	flagImport := flag.Bool("import", false, "alias for --action=import (legacy support)")
 
 	flag.Parse()
 
@@ -127,6 +130,11 @@ func main() {
 	if err := initDB(ctx, db); err != nil {
 		fmt.Fprintf(os.Stderr, "database initialization failed: %v\n", err)
 		os.Exit(1)
+	}
+
+	// Обработка алиаса --import для обратной совместимости
+	if *flagImport && *action == "" {
+		*action = "import"
 	}
 
 	switch *action {
@@ -218,8 +226,50 @@ func main() {
 	case "bulk":
 		bulkAction(ctx, db)
 
+	case "import":
+		// Сценарий: транзакционный массовый импорт пользователей.
+		// Либо все добавляются, либо ничего не меняется (атомарность).
+		items := []storage.CreateUserDTO{
+			{Email: "alice@example.com", Name: strPtr("Alice"), Age: intPtr(30)},
+			{Email: "bob@example.com", Name: strPtr("Bob"), Age: intPtr(25)},
+			{Email: "carol@example.com", Name: strPtr("Carol"), Age: intPtr(28)},
+		}
+
+		t0 := time.Now()
+		count, err := storage.BulkUpsertUsers(ctx, db, items)
+		dur := time.Since(t0)
+
+		type Result struct {
+			Action   string `json:"action"`
+			Status   string `json:"status"`
+			Count    int    `json:"count"`
+			Duration string `json:"duration"`
+			Message  string `json:"message,omitempty"`
+		}
+
+		if err != nil {
+			res := Result{
+				Action:   "import",
+				Status:   "failed",
+				Count:    count,
+				Duration: dur.String(),
+				Message:  err.Error(),
+			}
+			printJSON(res)
+			fmt.Fprintf(os.Stderr, "import failed: %v\n", err)
+			os.Exit(1)
+		}
+
+		res := Result{
+			Action:   "import",
+			Status:   "committed",
+			Count:    count,
+			Duration: dur.String(),
+		}
+		printJSON(res)
+
 	default:
-		fmt.Fprintln(os.Stderr, "error: unknown action. use --action=create|get|list|update|delete|bulk")
+		fmt.Fprintln(os.Stderr, "error: unknown action. use --action=create|get|list|update|delete|bulk|import")
 		os.Exit(1)
 	}
 }

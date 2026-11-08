@@ -6,46 +6,41 @@ import (
 	"fmt"
 )
 
-// BulkUpsertUsers загружает пользователей через подготовленное выражение.
-// Использует INSERT OR REPLACE для эмуляции upsert в SQLite.
 func BulkUpsertUsers(ctx context.Context, db *sql.DB, items []CreateUserDTO) (int, error) {
-	const query = `
-		INSERT OR REPLACE INTO users(email, name, age)
-		VALUES(?, ?, ?)
-	`
-
-	stmt, err := db.PrepareContext(ctx, query)
-	if err != nil {
-		return 0, fmt.Errorf("prepare upsert users: %w", err)
-	}
-	defer stmt.Close() // гарантирует закрытие даже при ошибках
-
 	count := 0
-	for _, dto := range items {
-		var nameVal interface{} = nil
-		if dto.Name != nil {
-			nameVal = *dto.Name
-		}
 
-		var ageVal interface{} = nil
-		if dto.Age != nil {
-			ageVal = *dto.Age
-		}
+	err := withTx(ctx, db, func(tx *sql.Tx) error {
+		const query = `INSERT OR REPLACE INTO users(email, name, age) VALUES(?, ?, ?)`
 
-		_, err := stmt.ExecContext(ctx, dto.Email, nameVal, ageVal)
-		if err != nil {
-			// Можно решить: прервать весь bulk или пропустить одну строку.
-			// Здесь прерываем, чтобы не портить целостность.
-			return count, fmt.Errorf("exec upsert for %s: %w", dto.Email, err)
+		stmt, stmtErr := tx.PrepareContext(ctx, query)
+		if stmtErr != nil {
+			return fmt.Errorf("prepare upsert stmt: %w", stmtErr)
 		}
-		count++
-	}
+		defer stmt.Close()
 
-	return count, nil
+		for _, dto := range items {
+			var nameVal interface{} = nil
+			if dto.Name != nil {
+				nameVal = *dto.Name
+			}
+
+			var ageVal interface{} = nil
+			if dto.Age != nil {
+				ageVal = *dto.Age
+			}
+
+			_, execErr := stmt.ExecContext(ctx, dto.Email, nameVal, ageVal)
+			if execErr != nil {
+				return fmt.Errorf("exec upsert for %s: %w", dto.Email, execErr)
+			}
+			count++
+		}
+		return nil
+	})
+
+	return count, err
 }
 
-// ListUsersByEmailPrefix демонстрирует работу: один Stmt + много QueryContext.
-// Это полезно, если нужно делать много выборок с разными параметрами.
 func ListUsersByEmailPrefix(ctx context.Context, stmt *sql.Stmt, prefixes []string) ([]User, int, error) {
 	var out []User
 	totalRows := 0
@@ -55,12 +50,14 @@ func ListUsersByEmailPrefix(ctx context.Context, stmt *sql.Stmt, prefixes []stri
 		if err != nil {
 			return nil, totalRows, fmt.Errorf("query for prefix %q: %w", prefix, err)
 		}
-		defer rows.Close() // важно: закрываем сразу после каждой итерации
+		// Закрываем сразу после обработки этой выборки
+		defer func() {
+			_ = rows.Close()
+		}()
 
 		for rows.Next() {
 			var u User
-			err := rows.Scan(&u.ID, &u.Email, &u.Name, &u.Age, &u.CreatedAt)
-			if err != nil {
+			if err := rows.Scan(&u.ID, &u.Email, &u.Name, &u.Age, &u.CreatedAt); err != nil {
 				return nil, totalRows, fmt.Errorf("scan row: %w", err)
 			}
 			out = append(out, u)
