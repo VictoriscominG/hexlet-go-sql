@@ -6,8 +6,8 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
 	"strconv"
-	"strings"
 	"time"
 
 	"database/sql"
@@ -21,9 +21,10 @@ func initDB(ctx context.Context, db *sql.DB) error {
 	createUsers := `
 		CREATE TABLE IF NOT EXISTS users (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			name VARCHAR(255) NOT NULL,
 			email VARCHAR(255) NOT NULL UNIQUE,
-			password_hash VARCHAR(255) NOT NULL
+			name VARCHAR(255),
+			age INTEGER,
+			created_at DATETIME NOT NULL DEFAULT (datetime('now'))
 		);
 	`
 
@@ -47,56 +48,33 @@ func initDB(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
-// ensureTestUser вставляет тестового пользователя, если его ещё нет
-func ensureTestUser(ctx context.Context, db *sql.DB) error {
-	const insertUserSQL = `
-		INSERT INTO users (name, email, password_hash)
-		VALUES (?, ?, ?)
-	`
-	_, err := db.ExecContext(ctx, insertUserSQL, "Orlando", "Orlan@gmail.com", "2H^sisters2026")
-	if err != nil {
-		// Ignore error if the user already exists (UNIQUE constraint)
-		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
-			log.Println("user already exists (expected for repeated runs)")
-			return nil
-		}
-		return fmt.Errorf("failed to insert test user: %w", err)
-	}
-	return nil
-}
-
-func parseIntList(s string) ([]int64, error) {
+func parseInt(s string) (*int, error) {
 	if s == "" {
 		return nil, nil
 	}
-	parts := strings.Split(s, ",")
-	res := make([]int64, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		v, err := strconv.ParseInt(p, 10, 64)
-		if err != nil {
-			return nil, err
-		}
-		res = append(res, v)
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return nil, err
 	}
-	return res, nil
+	return &v, nil
+}
+
+func printJSON(v interface{}) {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(v); err != nil {
+		log.Fatalf("failed to encode JSON: %v", err)
+	}
 }
 
 func main() {
-	// Флаги для CLI по курсам
-	action := flag.String("action", "list", "action: create|list|find")
-	slug := flag.String("slug", "", "slug for create")
-	title := flag.String("title", "", "title for create")
-	price := flag.Int("price", 0, "price for create")
+	action := flag.String("action", "", "action: create|get|list|update|delete")
 
-	limit := flag.Int("limit", 10, "limit for list")
-	offset := flag.Int("offset", 0, "offset for list")
-	order := flag.String("order", "id_asc", "sorting for list: price_asc|price_desc|title_asc|title_desc")
+	email := flag.String("email", "", "email (for create)")
+	name := flag.String("name", "", "name (for create/update)")
+	age := flag.String("age", "", "age (for create/update)")
 
-	idsStr := flag.String("ids", "", "comma-separated list of IDs for find")
+	idStr := flag.String("id", "", "user ID (for get/update/delete)")
 
 	flag.Parse()
 
@@ -105,7 +83,8 @@ func main() {
 
 	db, err := sql.Open("sqlite", "file:data.db?_foreign_keys=on&_busy_timeout=5000")
 	if err != nil {
-		log.Fatalf("failed to open database: %v", err)
+		fmt.Fprintf(os.Stderr, "failed to open database: %v\n", err)
+		os.Exit(1)
 	}
 	defer db.Close()
 
@@ -114,79 +93,121 @@ func main() {
 	db.SetConnMaxLifetime(5 * time.Minute)
 
 	if err := db.PingContext(ctx); err != nil {
-		log.Fatalf("database ping failed: %v", err)
+		fmt.Fprintf(os.Stderr, "database ping failed: %v\n", err)
+		os.Exit(1)
 	}
 
-	// Создаём таблицы и добавляем тестового пользователя
 	if err := initDB(ctx, db); err != nil {
-		log.Fatalf("database initialization failed: %v", err)
-	}
-	if err := ensureTestUser(ctx, db); err != nil {
-		log.Fatalf("test user setup failed: %v", err)
+		fmt.Fprintf(os.Stderr, "database initialization failed: %v\n", err)
+		os.Exit(1)
 	}
 
-	// Выводим тестового пользователя в JSON
-	var u struct {
-		ID    int64  `json:"id"`
-		Name  string `json:"name"`
-		Email string `json:"email"`
-	}
-	row := db.QueryRowContext(ctx, "SELECT id, name, email FROM users WHERE email = ?", "Orlan@gmail.com")
-	err = row.Scan(&u.ID, &u.Name, &u.Email)
-	if err != nil {
-		log.Fatalf("failed to scan user row: %v", err)
-	}
-	payload, _ := json.MarshalIndent(u, "", "  ")
-	log.Printf("Test user loaded: %s", payload)
-
-	// CLI for courses
 	switch *action {
 	case "create":
-		if *slug == "" || *title == "" {
-			log.Fatal("the 'create' action requires -slug and -title flags")
+		if *email == "" {
+			fmt.Fprintln(os.Stderr, "error: --email is required for create")
+			os.Exit(1)
 		}
-		c := storage.Course{
-			Slug:  *slug,
-			Title: *title,
-			Price: *price,
-		}
-		id, err := storage.CreateCourse(ctx, db, c)
+
+		namePtr := parseStringPtr(*name)
+		agePtr, err := parseInt(*age)
 		if err != nil {
-			log.Fatalf("course creation failed: %v", err)
+			fmt.Fprintf(os.Stderr, "error: invalid --age: %v\n", err)
+			os.Exit(1)
 		}
-		fmt.Printf("Course created with id=%d\n", id)
+
+		dto := storage.CreateUserDTO{
+			Email: *email,
+			Name:  namePtr,
+			Age:   agePtr,
+		}
+		user, err := storage.CreateUser(ctx, db, dto)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: create user failed: %v\n", err)
+			os.Exit(1)
+		}
+		printJSON(user)
+
+	case "get":
+		id, err := parseID(*idStr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: invalid --id: %v\n", err)
+			os.Exit(1)
+		}
+		user, err := storage.GetUser(ctx, db, id)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: get user failed: %v\n", err)
+			os.Exit(1)
+		}
+		printJSON(user)
 
 	case "list":
-		courses, err := storage.ListCourses(ctx, db, *limit, *offset, *order)
+		users, err := storage.ListUsers(ctx, db)
 		if err != nil {
-			log.Fatalf("listing courses failed: %v", err)
+			fmt.Fprintf(os.Stderr, "error: list users failed: %v\n", err)
+			os.Exit(1)
 		}
-		if len(courses) == 0 {
-			fmt.Println("No courses found.")
-			return
-		}
-		for _, c := range courses {
-			fmt.Printf("[%d] %s (%s) — %d RUB\n", c.ID, c.Title, c.Slug, c.Price)
+		printJSON(users)
+
+	case "update":
+		id, err := parseID(*idStr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: invalid --id: %v\n", err)
+			os.Exit(1)
 		}
 
-	case "find":
-		ids, err := parseIntList(*idsStr)
+		namePtr := parseStringPtr(*name)
+		agePtr, err := parseInt(*age)
 		if err != nil {
-			log.Fatalf("invalid format for -ids: %v", err)
+			fmt.Fprintf(os.Stderr, "error: invalid --age: %v\n", err)
+			os.Exit(1)
 		}
-		courses, err := storage.FindCoursesByIDs(ctx, db, ids)
+
+		dto := storage.UpdateUserDTO{
+			ID:   id,
+			Name: namePtr,
+			Age:  agePtr,
+		}
+		user, err := storage.UpdateUser(ctx, db, dto)
 		if err != nil {
-			log.Fatalf("searching courses by IDs failed: %v", err)
+			fmt.Fprintf(os.Stderr, "error: update user failed: %v\n", err)
+			os.Exit(1)
 		}
-		if len(courses) == 0 {
-			fmt.Println("No courses found for the specified IDs.")
-			return
+		printJSON(user)
+
+	case "delete":
+		id, err := parseID(*idStr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: invalid --id: %v\n", err)
+			os.Exit(1)
 		}
-		for _, c := range courses {
-			fmt.Printf("[%d] %s (%s) — %d RUB\n", c.ID, c.Title, c.Slug, c.Price)
+		user, err := storage.DeleteUser(ctx, db, id)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: delete user failed: %v\n", err)
+			os.Exit(1)
 		}
+		printJSON(user)
 
 	default:
-		log.Fatalf("unknown action: %s", *action)
+		fmt.Fprintln(os.Stderr, "error: unknown action. use --action=create|get|list|update|delete")
+		os.Exit(1)
 	}
+}
+
+func parseStringPtr(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+func parseID(s string) (int64, error) {
+	if s == "" {
+		return 0, fmt.Errorf("--id is required")
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return v, nil
 }

@@ -4,98 +4,108 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strings"
 )
 
-// CreateCourse создаёт курс и возвращает его ID
-func CreateCourse(ctx context.Context, db *sql.DB, c Course) (int64, error) {
+// CreateUser создаёт пользователя и возвращает полную запись.
+func CreateUser(ctx context.Context, db *sql.DB, dto CreateUserDTO) (User, error) {
 	const query = `
-		INSERT INTO courses(slug, title, price)
+		INSERT INTO users(email, name, age)
 		VALUES(?, ?, ?)
-		RETURNING id
+		RETURNING id, email, name, age, created_at
 	`
 
-	var id int64
-	err := db.QueryRowContext(ctx, query, c.Slug, c.Title, c.Price).Scan(&id)
-	if err != nil {
-		return 0, fmt.Errorf("create course: %w", err)
+	var out User
+	// Если Name/Age не переданы — в SQL будет NULL, это ок.
+	if err := db.QueryRowContext(ctx, query, dto.Email, dto.Name, dto.Age).
+		Scan(&out.ID, &out.Email, &out.Name, &out.Age, &out.CreatedAt); err != nil {
+		return User{}, fmt.Errorf("create user: %w", err)
 	}
-	return id, nil
+	return out, nil
 }
 
-// ListCourses — пагинация + безопасная сортировка по белому списку
-func ListCourses(ctx context.Context, db *sql.DB, limit, offset int, order string) ([]Course, error) {
-	allowedOrder := map[string]string{
-		"price_asc":  "price ASC",
-		"price_desc": "price DESC",
-		"title_asc":  "title ASC",
-		"title_desc": "title DESC",
-	}
-
-	ord, ok := allowedOrder[order]
-	if !ok {
-		ord = "id ASC"
-	}
-
-	// Конкатенируем только заранее разрешённое значение сортировки.
-	// LIMIT и OFFSET передаём через плейсхолдеры.
-	query := `
-		SELECT id, slug, title, price
-		FROM courses
-		ORDER BY ` + ord + `
-		LIMIT ? OFFSET ?
+// GetUser получает пользователя по ID.
+func GetUser(ctx context.Context, db *sql.DB, id int64) (User, error) {
+	const query = `
+		SELECT id, email, name, age, created_at
+		FROM users
+		WHERE id = ?
 	`
 
-	rows, err := db.QueryContext(ctx, query, limit, offset)
+	var u User
+	if err := db.QueryRowContext(ctx, query, id).
+		Scan(&u.ID, &u.Email, &u.Name, &u.Age, &u.CreatedAt); err != nil {
+		return User{}, fmt.Errorf("get user: %w", err)
+	}
+	return u, nil
+}
+
+// ListUsers возвращает всех пользователей.
+func ListUsers(ctx context.Context, db *sql.DB) ([]User, error) {
+	const query = `
+		SELECT id, email, name, age, created_at
+		FROM users
+		ORDER BY id
+	`
+
+	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("list courses: %w", err)
+		return nil, fmt.Errorf("list users: %w", err)
 	}
 	defer rows.Close()
 
-	var out []Course
+	var out []User
 	for rows.Next() {
-		var c Course
-		if err := rows.Scan(&c.ID, &c.Slug, &c.Title, &c.Price); err != nil {
-			return nil, fmt.Errorf("scan course: %w", err)
+		var u User
+		if err := rows.Scan(&u.ID, &u.Email, &u.Name, &u.Age, &u.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan user: %w", err)
 		}
-		out = append(out, c)
+		out = append(out, u)
 	}
 	return out, rows.Err()
 }
 
-// FindCoursesByIDs — поиск по списку ID с динамическими плейсхолдерами
-func FindCoursesByIDs(ctx context.Context, db *sql.DB, ids []int64) ([]Course, error) {
-	if len(ids) == 0 {
-		return []Course{}, nil
-	}
-
-	placeholders := strings.Repeat("?,", len(ids))
-	placeholders = placeholders[:len(placeholders)-1] // убираем последний запятую
-
-	args := make([]any, len(ids))
-	for i, id := range ids {
-		args[i] = id
-	}
-
-	query := `
-		SELECT id, slug, title, price
-		FROM courses
-		WHERE id IN (` + placeholders + `)
+// UpdateUser делает частичное обновление: обновляет только переданные поля.
+func UpdateUser(ctx context.Context, db *sql.DB, dto UpdateUserDTO) (User, error) {
+	const query = `
+		UPDATE users
+		SET name = COALESCE(?, name),
+		    age  = COALESCE(?, age)
+		WHERE id = ?
+		RETURNING id, email, name, age, created_at
 	`
 
-	rows, err := db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("find courses: %w", err)
+	var out User
+	if err := db.QueryRowContext(ctx, query, dto.Name, dto.Age, dto.ID).
+		Scan(&out.ID, &out.Email, &out.Name, &out.Age, &out.CreatedAt); err != nil {
+		return User{}, fmt.Errorf("update user: %w", err)
 	}
-	defer rows.Close()
+	return out, nil
+}
 
-	var out []Course
-	for rows.Next() {
-		var c Course
-		if err := rows.Scan(&c.ID, &c.Slug, &c.Title, &c.Price); err != nil {
-			return nil, fmt.Errorf("scan course by ID: %w", err)
-		}
-		out = append(out, c)
+// DeleteUser удаляет пользователя по ID и возвращает удалённый объект (или пустой с ID).
+func DeleteUser(ctx context.Context, db *sql.DB, id int64) (User, error) {
+	const getQuery = `
+		SELECT id, email, name, age, created_at
+		FROM users
+		WHERE id = ?
+	`
+	const deleteQuery = `
+		DELETE FROM users
+		WHERE id = ?
+	`
+
+	// Сначала читаем, чтобы вернуть данные (как будто «получили перед удалением»)
+	var out User
+	if err := db.QueryRowContext(ctx, getQuery, id).
+		Scan(&out.ID, &out.Email, &out.Name, &out.Age, &out.CreatedAt); err != nil {
+		// Если не найден — это тоже ошибка, но можно трактовать как «not found»
+		return User{}, fmt.Errorf("delete user: get before delete failed: %w", err)
 	}
-	return out, rows.Err()
+
+	_, err := db.ExecContext(ctx, deleteQuery, id)
+	if err != nil {
+		return User{}, fmt.Errorf("delete user: exec delete failed: %w", err)
+	}
+
+	return out, nil
 }
