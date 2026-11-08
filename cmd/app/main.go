@@ -67,8 +67,35 @@ func printJSON(v interface{}) {
 	}
 }
 
+func parseStringPtr(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+func parseID(s string) (int64, error) {
+	if s == "" {
+		return 0, fmt.Errorf("--id is required")
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return v, nil
+}
+
+// strPtr и intPtr нужны только для генерации тестовых данных в bulk-команде
+func strPtr(s string) *string {
+	return &s
+}
+
+func intPtr(i int) *int {
+	return &i
+}
+
 func main() {
-	action := flag.String("action", "", "action: create|get|list|update|delete")
+	action := flag.String("action", "", "action: create|get|list|update|delete|bulk")
 
 	email := flag.String("email", "", "email (for create)")
 	name := flag.String("name", "", "name (for create/update)")
@@ -188,26 +215,61 @@ func main() {
 		}
 		printJSON(user)
 
+	case "bulk":
+		bulkAction(ctx, db)
+
 	default:
-		fmt.Fprintln(os.Stderr, "error: unknown action. use --action=create|get|list|update|delete")
+		fmt.Fprintln(os.Stderr, "error: unknown action. use --action=create|get|list|update|delete|bulk")
 		os.Exit(1)
 	}
 }
 
-func parseStringPtr(s string) *string {
-	if s == "" {
-		return nil
+func bulkAction(ctx context.Context, db *sql.DB) {
+	// Пример тестовых данных для bulk-upsert
+	items := []storage.CreateUserDTO{
+		{Email: "user1@example.com", Name: strPtr("User One"), Age: intPtr(25)},
+		{Email: "user2@example.com", Name: strPtr("User Two"), Age: intPtr(30)},
+		{Email: "user3@example.com", Name: strPtr("User Three"), Age: intPtr(35)},
+		{Email: "user4@example.com", Name: strPtr("User Four"), Age: intPtr(40)},
+		{Email: "user5@example.com", Name: strPtr("User Five"), Age: intPtr(45)},
 	}
-	return &s
-}
 
-func parseID(s string) (int64, error) {
-	if s == "" {
-		return 0, fmt.Errorf("--id is required")
-	}
-	v, err := strconv.ParseInt(s, 10, 64)
+	// --- Сценарий 1: Bulk upsert через подготовленное выражение ---
+	t0 := time.Now()
+	count, err := storage.BulkUpsertUsers(ctx, db, items)
+	dur := time.Since(t0)
+
 	if err != nil {
-		return 0, err
+		fmt.Fprintf(os.Stderr, "bulk upsert failed: %v\n", err)
+		os.Exit(1)
 	}
-	return v, nil
+
+	fmt.Printf("bulk upsert completed: %d rows in %v\n", count, dur)
+
+	// --- Сценарий 2: Один Stmt + много QueryContext по префиксам ---
+	const selectQuery = `
+		SELECT id, email, name, age, created_at
+		FROM users
+		WHERE email LIKE ?
+	`
+	stmt, err := db.PrepareContext(ctx, selectQuery)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "prepare select: %v\n", err)
+		os.Exit(1)
+	}
+	defer stmt.Close() // гарантирует закрытие даже при ошибках
+
+	prefixes := []string{"user", "test"} // разные префиксы для демонстрации
+
+	t1 := time.Now()
+	users, totalRows, err := storage.ListUsersByEmailPrefix(ctx, stmt, prefixes)
+	durSelect := time.Since(t1)
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "select by prefixes failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	printJSON(users)
+	fmt.Printf("select by prefixes: %d total rows in %v\n", totalRows, durSelect)
 }
