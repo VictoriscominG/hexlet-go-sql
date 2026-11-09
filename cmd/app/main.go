@@ -2,49 +2,44 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"time"
-
-	"database/sql"
 
 	_ "modernc.org/sqlite"
 
 	"example.com/go-sql/internal/storage"
 )
 
-func initDB(ctx context.Context, db *sql.DB) error {
-	createUsers := `
-		CREATE TABLE IF NOT EXISTS users (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			email VARCHAR(255) NOT NULL UNIQUE,
-			name VARCHAR(255),
-			age INTEGER,
-			created_at DATETIME NOT NULL DEFAULT (datetime('now'))
-		);
-	`
-
-	createCourses := `
-		CREATE TABLE IF NOT EXISTS courses (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			slug TEXT NOT NULL UNIQUE,
-			title TEXT NOT NULL,
-			price INTEGER NOT NULL DEFAULT 0
-		);
-	`
-
-	if _, err := db.ExecContext(ctx, createUsers); err != nil {
-		return fmt.Errorf("failed to create users table: %w", err)
+// initDB применяет миграции из каталога migrations (в порядке имён файлов).
+// Это же содержимое sqlc читает как схему — источник один, расхождений нет.
+func initDB(ctx context.Context, sqlDB *sql.DB, dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("read migrations dir: %w", err)
 	}
 
-	if _, err := db.ExecContext(ctx, createCourses); err != nil {
-		return fmt.Errorf("failed to create courses table: %w", err)
-	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) != ".sql" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			return fmt.Errorf("read %s: %w", e.Name(), err)
+		}
+		if _, err := sqlDB.ExecContext(ctx, string(data)); err != nil {
+			return fmt.Errorf("exec %s: %w", e.Name(), err)
+		}
+	}
 	return nil
 }
 
@@ -111,26 +106,28 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	db, err := sql.Open("sqlite", "file:data.db?_foreign_keys=on&_busy_timeout=5000")
+	sqlDB, err := sql.Open("sqlite", "file:data.db?_foreign_keys=on&_busy_timeout=5000")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to open database: %v\n", err)
 		os.Exit(1)
 	}
-	defer db.Close()
+	defer sqlDB.Close()
 
-	db.SetMaxOpenConns(10)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(5 * time.Minute)
+	sqlDB.SetMaxOpenConns(10)
+	sqlDB.SetMaxIdleConns(5)
+	sqlDB.SetConnMaxLifetime(5 * time.Minute)
 
-	if err := db.PingContext(ctx); err != nil {
+	if err := sqlDB.PingContext(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "database ping failed: %v\n", err)
 		os.Exit(1)
 	}
 
-	if err := initDB(ctx, db); err != nil {
+	if err := initDB(ctx, sqlDB, "migrations"); err != nil {
 		fmt.Fprintf(os.Stderr, "database initialization failed: %v\n", err)
 		os.Exit(1)
 	}
+
+	repo := storage.NewRepo(sqlDB)
 
 	// Обработка алиаса --import для обратной совместимости
 	if *flagImport && *action == "" {
@@ -144,19 +141,12 @@ func main() {
 			os.Exit(1)
 		}
 
-		namePtr := parseStringPtr(*name)
-		agePtr, err := parseInt(*age)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: invalid --age: %v\n", err)
-			os.Exit(1)
-		}
-
 		dto := storage.CreateUserDTO{
 			Email: *email,
-			Name:  namePtr,
-			Age:   agePtr,
+			Name:  parseStringPtr(*name),
+			Age:   parseAgeFlag(*age),
 		}
-		user, err := storage.CreateUser(ctx, db, dto)
+		user, err := repo.CreateUser(ctx, dto)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: create user failed: %v\n", err)
 			os.Exit(1)
@@ -169,7 +159,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error: invalid --id: %v\n", err)
 			os.Exit(1)
 		}
-		user, err := storage.GetUser(ctx, db, id)
+		user, err := repo.GetUser(ctx, id)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: get user failed: %v\n", err)
 			os.Exit(1)
@@ -177,7 +167,7 @@ func main() {
 		printJSON(user)
 
 	case "list":
-		users, err := storage.ListUsers(ctx, db)
+		users, err := repo.ListUsers(ctx)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: list users failed: %v\n", err)
 			os.Exit(1)
@@ -191,19 +181,12 @@ func main() {
 			os.Exit(1)
 		}
 
-		namePtr := parseStringPtr(*name)
-		agePtr, err := parseInt(*age)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: invalid --age: %v\n", err)
-			os.Exit(1)
-		}
-
 		dto := storage.UpdateUserDTO{
 			ID:   id,
-			Name: namePtr,
-			Age:  agePtr,
+			Name: parseStringPtr(*name),
+			Age:  parseAgeFlag(*age),
 		}
-		user, err := storage.UpdateUser(ctx, db, dto)
+		user, err := repo.UpdateUser(ctx, dto)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: update user failed: %v\n", err)
 			os.Exit(1)
@@ -216,7 +199,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error: invalid --id: %v\n", err)
 			os.Exit(1)
 		}
-		user, err := storage.DeleteUser(ctx, db, id)
+		user, err := repo.DeleteUser(ctx, id)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: delete user failed: %v\n", err)
 			os.Exit(1)
@@ -224,7 +207,7 @@ func main() {
 		printJSON(user)
 
 	case "bulk":
-		bulkAction(ctx, db)
+		bulkAction(ctx, repo)
 
 	case "import":
 		// Сценарий: транзакционный массовый импорт пользователей.
@@ -236,7 +219,7 @@ func main() {
 		}
 
 		t0 := time.Now()
-		count, err := storage.BulkUpsertUsers(ctx, db, items)
+		count, err := repo.BulkUpsertUsers(ctx, items)
 		dur := time.Since(t0)
 
 		type Result struct {
@@ -274,7 +257,17 @@ func main() {
 	}
 }
 
-func bulkAction(ctx context.Context, db *sql.DB) {
+// parseAgeFlag — обёртка, чтобы не тащить проверку ошибки в каждую ветку switch.
+func parseAgeFlag(s string) *int {
+	agePtr, err := parseInt(s)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: invalid --age: %v\n", err)
+		os.Exit(1)
+	}
+	return agePtr
+}
+
+func bulkAction(ctx context.Context, repo *storage.Repo) {
 	// Пример тестовых данных для bulk-upsert
 	items := []storage.CreateUserDTO{
 		{Email: "user1@example.com", Name: strPtr("User One"), Age: intPtr(25)},
@@ -286,7 +279,7 @@ func bulkAction(ctx context.Context, db *sql.DB) {
 
 	// --- Сценарий 1: Bulk upsert через подготовленное выражение ---
 	t0 := time.Now()
-	count, err := storage.BulkUpsertUsers(ctx, db, items)
+	count, err := repo.BulkUpsertUsers(ctx, items)
 	dur := time.Since(t0)
 
 	if err != nil {
@@ -297,22 +290,10 @@ func bulkAction(ctx context.Context, db *sql.DB) {
 	fmt.Printf("bulk upsert completed: %d rows in %v\n", count, dur)
 
 	// --- Сценарий 2: Один Stmt + много QueryContext по префиксам ---
-	const selectQuery = `
-		SELECT id, email, name, age, created_at
-		FROM users
-		WHERE email LIKE ?
-	`
-	stmt, err := db.PrepareContext(ctx, selectQuery)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "prepare select: %v\n", err)
-		os.Exit(1)
-	}
-	defer stmt.Close() // гарантирует закрытие даже при ошибках
-
-	prefixes := []string{"user", "test"} // разные префиксы для демонстрации
+	prefixes := []string{"user", "test"}
 
 	t1 := time.Now()
-	users, totalRows, err := storage.ListUsersByEmailPrefix(ctx, stmt, prefixes)
+	users, totalRows, err := repo.ListUsersByEmailPrefix(ctx, prefixes)
 	durSelect := time.Since(t1)
 
 	if err != nil {
